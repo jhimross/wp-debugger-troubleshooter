@@ -6,8 +6,8 @@ A powerful, session-based WordPress plugin for safe debugging and comprehensive 
 **Tags:** debug, troubleshoot, php info, developer
 **Requires at least:** 5.0
 **Requires PHP:** 7.4
-**Tested up to:** 6.8
-**Stable tag:** 1.3.0
+**Tested up to:** 6.9
+**Stable tag:** 1.4.0
 **License:** GPL-2.0+
 **License URI:** http://www.gnu.org/licenses/gpl-2.0.txt
 **Donate link:** https://paypal.me/jhimross28
@@ -114,6 +114,14 @@ A: The plugin leverages the `plugins_loaded` hook to define the necessary `WP_DE
 ---
 
 ## Changelog
+
+### 1.4.0 - 2026-03-19
+* **Security Fix (Critical):** Resolved a privilege escalation vulnerability where unauthenticated users could bypass authentication via the User Simulation feature.
+* **Security Fix (High):** Patched an authorization bypass in the Troubleshooting Mode configuration. State is now securely validated against database records using cryptographic tokens.
+* **Security Fix (Medium):** Added strict nonces to the "Exit Simulation" admin bar action to prevent Cross-Site Request Forgery (CSRF). 
+* **Fix:** Completely overhauled the "Troubleshooting Mode" plugin logic. The plugin now correctly intercepts early plugin loading via an automatically dropping MU (Must-Use) plugin template, resolving the issue where plugins were not adequately disabled during simulations.
+* **Fix:** Disconnected WP_Filesystem API usage from AJAX context actions down to native PHP handlers to prevent silent AJAX failures on servers requiring FTP credentials.
+* **Fix:** Adjusted the "Exit Simulation" JavaScript rendering hook to ensure the "Exit Simulation" admin bar button functions properly on the front-end.
 
 ### 1.3.2 - 2026-02-11
 * **Fix:** Resolved a UI conflict where the confirmation modal appeared automatically upon page load due to CSS class interference from other plugins.

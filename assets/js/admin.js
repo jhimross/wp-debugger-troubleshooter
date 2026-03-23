@@ -336,7 +336,13 @@ jQuery(document).ready(function ($) {
             success: function (response) {
                 if (response.success) {
                     showAlert(debugTroubleshoot.alert_title_success, response.data.message);
-                    setTimeout(function () { location.reload(); }, 500);
+                    setTimeout(function () { 
+                        if (response.data && response.data.redirect) {
+                            window.location.href = response.data.redirect;
+                        } else {
+                            location.reload(); 
+                        }
+                    }, 500);
                 } else {
                     showAlert(debugTroubleshoot.alert_title_error, response.data.message, 'error');
                     $button.prop('disabled', false).text('Simulate User');

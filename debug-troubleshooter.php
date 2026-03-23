@@ -3,7 +3,7 @@
  * Plugin Name:       Debugger & Troubleshooter
  * Plugin URI:        https://wordpress.org/plugins/debugger-troubleshooter
  * Description:       A WordPress plugin for debugging and troubleshooting, allowing simulated plugin deactivation and theme switching without affecting the live site.
- * Version:           1.3.2
+ * Version:           1.4.0
  * Author:            Jhimross
  * Author URI:        https://profiles.wordpress.org/jhimross
  * License:           GPL-2.0+
@@ -21,7 +21,7 @@ if (!defined('ABSPATH')) {
 /**
  * Define plugin constants.
  */
-define('DBGTBL_VERSION', '1.3.2');
+define('DBGTBL_VERSION', '1.4.0');
 define('DBGTBL_DIR', plugin_dir_path(__FILE__));
 define('DBGTBL_URL', plugin_dir_url(__FILE__));
 define('DBGTBL_BASENAME', plugin_basename(__FILE__));
@@ -79,6 +79,10 @@ class Debug_Troubleshooter
 		// Admin notice for troubleshooting mode.
 		add_action('admin_notices', array($this, 'troubleshooting_mode_notice'));
 		add_action('admin_bar_menu', array($this, 'admin_bar_exit_simulation'), 999);
+
+		// Include exit simulation script if active.
+		add_action('wp_footer', array($this, 'print_exit_simulation_script'));
+		add_action('admin_footer', array($this, 'print_exit_simulation_script'));
 	}
 
 
@@ -473,10 +477,12 @@ class Debug_Troubleshooter
 	public function init_troubleshooting_mode()
 	{
 		if (isset($_COOKIE[self::TROUBLESHOOT_COOKIE])) {
-			// phpcs:ignore WordPress.Security.ValidatedSanitizedInput.InputNotSanitized
-			$this->troubleshoot_state = json_decode(wp_unslash($_COOKIE[self::TROUBLESHOOT_COOKIE]), true);
+			$token = sanitize_text_field(wp_unslash($_COOKIE[self::TROUBLESHOOT_COOKIE]));
+			$sessions = get_option('dbgtbl_sessions', array());
 
-			if (!empty($this->troubleshoot_state)) {
+			if (isset($sessions[$token]) && is_array($sessions[$token])) {
+				$this->troubleshoot_state = $sessions[$token];
+
 				// Define DONOTCACHEPAGE to prevent caching plugins from interfering.
 				if (!defined('DONOTCACHEPAGE')) {
 					// phpcs:ignore WordPress.NamingConventions.PrefixAllGlobals.NonPrefixedConstantFound
@@ -485,10 +491,10 @@ class Debug_Troubleshooter
 				// Send no-cache headers as a secondary measure.
 				nocache_headers();
 
-				// Filter active plugins.
-				add_filter('option_active_plugins', array($this, 'filter_active_plugins'));
+				// Filter active plugins. Note: The actual plugin deactivation happens via the MU plugin.
+				add_filter('option_active_plugins', array($this, 'filter_active_plugins'), 0);
 				if (is_multisite()) {
-					add_filter('site_option_active_sitewide_plugins', array($this, 'filter_active_sitewide_plugins'));
+					add_filter('site_option_active_sitewide_plugins', array($this, 'filter_active_sitewide_plugins'), 0);
 				}
 
 				// Filter theme.
@@ -694,8 +700,17 @@ class Debug_Troubleshooter
 				'sitewide_plugins' => $current_sitewide_plugins,
 				'timestamp' => time(),
 			);
+			
+			$token = wp_generate_password(64, false);
+			$sessions = get_option('dbgtbl_sessions', array());
+			$sessions[$token] = $state;
+			update_option('dbgtbl_sessions', $sessions);
+			
+			// Create MU plugin drop-in to intercept early plugin loading
+			$this->install_mu_plugin();
+
 			// Set cookie with HttpOnly flag for security, and secure flag if site is HTTPS.
-			setcookie(self::TROUBLESHOOT_COOKIE, wp_json_encode($state), array(
+			setcookie(self::TROUBLESHOOT_COOKIE, $token, array(
 				'expires' => time() + DAY_IN_SECONDS,
 				'path' => COOKIEPATH,
 				'domain' => COOKIE_DOMAIN,
@@ -705,6 +720,17 @@ class Debug_Troubleshooter
 			));
 			wp_send_json_success(array('message' => __('Troubleshooting mode activated.', 'debugger-troubleshooter')));
 		} else {
+			$token = isset($_COOKIE[self::TROUBLESHOOT_COOKIE]) ? sanitize_text_field(wp_unslash($_COOKIE[self::TROUBLESHOOT_COOKIE])) : false;
+			if ($token) {
+				$sessions = get_option('dbgtbl_sessions', array());
+				unset($sessions[$token]);
+				update_option('dbgtbl_sessions', $sessions);
+				
+				if (empty($sessions)) {
+					$this->remove_mu_plugin();
+				}
+			}
+
 			// Unset the cookie to exit troubleshooting mode.
 			setcookie(self::TROUBLESHOOT_COOKIE, '', array(
 				'expires' => time() - 3600, // Expire the cookie.
@@ -760,15 +786,19 @@ class Debug_Troubleshooter
 			'timestamp' => time(),
 		);
 
-		// Set cookie with HttpOnly flag for security, and secure flag if site is HTTPS.
-		setcookie(self::TROUBLESHOOT_COOKIE, wp_json_encode($state), array(
-			'expires' => time() + DAY_IN_SECONDS,
-			'path' => COOKIEPATH,
-			'domain' => COOKIE_DOMAIN,
-			'samesite' => 'Lax',
-			'httponly' => true,
-			'secure' => is_ssl(),
-		));
+		$token = isset($_COOKIE[self::TROUBLESHOOT_COOKIE]) ? sanitize_text_field(wp_unslash($_COOKIE[self::TROUBLESHOOT_COOKIE])) : false;
+		if (!$token) {
+			wp_send_json_error(array('message' => __('Troubleshooting session not found.', 'debugger-troubleshooter')));
+		}
+
+		$sessions = get_option('dbgtbl_sessions', array());
+		if (isset($sessions[$token])) {
+			$sessions[$token] = $state;
+			update_option('dbgtbl_sessions', $sessions);
+		} else {
+			wp_send_json_error(array('message' => __('Invalid troubleshooting session.', 'debugger-troubleshooter')));
+		}
+
 		wp_send_json_success(array('message' => __('Troubleshooting state updated successfully. Refreshing page...', 'debugger-troubleshooter')));
 	}
 
@@ -797,11 +827,16 @@ class Debug_Troubleshooter
 	public function init_user_simulation()
 	{
 		if (isset($_COOKIE[self::SIMULATE_USER_COOKIE])) {
-			$this->simulated_user_id = (int) $_COOKIE[self::SIMULATE_USER_COOKIE];
+			$token = sanitize_text_field(wp_unslash($_COOKIE[self::SIMULATE_USER_COOKIE]));
+			$sim_users = get_option('dbgtbl_sim_users', array());
+			
+			if (isset($sim_users[$token])) {
+				$this->simulated_user_id = (int) $sim_users[$token];
 
-			// Hook into determine_current_user to override the user ID.
-			// Priority 20 ensures we run after most standard authentication checks.
-			add_filter('determine_current_user', array($this, 'simulate_user_filter'), 20);
+				// Hook into determine_current_user to override the user ID.
+				// Priority 20 ensures we run after most standard authentication checks.
+				add_filter('determine_current_user', array($this, 'simulate_user_filter'), 20);
+			}
 		}
 	}
 
@@ -877,11 +912,6 @@ class Debug_Troubleshooter
 					'title' => __('Click to return to your original user account', 'debugger-troubleshooter'),
 				),
 			));
-
-			// Add inline script for the exit action since we might be on the frontend
-			// where our admin.js isn't enqueued, or we need a global handler.
-			add_action('wp_footer', array($this, 'print_exit_simulation_script'));
-			add_action('admin_footer', array($this, 'print_exit_simulation_script'));
 		}
 	}
 
@@ -890,22 +920,17 @@ class Debug_Troubleshooter
 	 */
 	public function print_exit_simulation_script()
 	{
+		if (!$this->is_simulating_user()) {
+			return;
+		}
+
+		$nonce = wp_create_nonce('debug_troubleshoot_nonce');
+		$exit_url = admin_url('admin-ajax.php?action=debug_troubleshoot_toggle_simulate_user&enable=0&nonce=' . $nonce);
 		?>
 		<script type="text/javascript">
 			function debugTroubleshootExitSimulation() {
 				if (confirm('<?php echo esc_js(__('Are you sure you want to exit User Simulation?', 'debugger-troubleshooter')); ?>')) {
-					var data = new FormData();
-					data.append('action', 'debug_troubleshoot_toggle_simulate_user');
-					data.append('enable', '0');
-					// We might not have the nonce available globally on frontend, so we rely on cookie check in backend mostly,
-					// but for AJAX we need it. If we are on frontend, we might need to expose it.
-					// For simplicity in this MVP, we'll assume admin-ajax is accessible.
-					// SECURITY NOTE: In a real scenario, we should localize the nonce on wp_enqueue_scripts as well if we want frontend support.
-					// For now, let's try to fetch it from a global if available, or just rely on the cookie clearing which is less secure but functional for a dev tool.
-					// BETTER APPROACH: Use a dedicated endpoint or just a simple GET parameter that we intercept on init to clear the cookie.
-
-					// Let's use a simple redirect to a URL that handles the exit.
-					window.location.href = '<?php echo esc_url(admin_url('admin-ajax.php?action=debug_troubleshoot_toggle_simulate_user&enable=0')); ?>';
+					window.location.href = <?php echo wp_json_encode($exit_url); ?>;
 				}
 			}
 		</script>
@@ -917,14 +942,7 @@ class Debug_Troubleshooter
 	 */
 	public function ajax_toggle_simulate_user()
 	{
-		// Note: For the "Exit" action via GET request (from Admin Bar), we might not have a nonce.
-		// Since this is a dev tool and we are just clearing a cookie, the risk is low, but ideally we'd check a nonce.
-		// For the "Enter" action (POST), we definitely check the nonce.
-
-		$is_post = isset($_SERVER['REQUEST_METHOD']) && 'POST' === $_SERVER['REQUEST_METHOD'];
-		if ($is_post) {
-			check_ajax_referer('debug_troubleshoot_nonce', 'nonce');
-		}
+		check_ajax_referer('debug_troubleshoot_nonce', 'nonce');
 
 		if (!current_user_can('manage_options') && !$this->is_simulating_user()) {
 			// Only allow admins to START simulation.
@@ -934,10 +952,16 @@ class Debug_Troubleshooter
 
 		$enable = isset($_REQUEST['enable']) ? (bool) $_REQUEST['enable'] : false;
 		$user_id = isset($_REQUEST['user_id']) ? (int) $_REQUEST['user_id'] : 0;
+		$is_post = isset($_SERVER['REQUEST_METHOD']) && 'POST' === $_SERVER['REQUEST_METHOD'];
 
 		if ($enable && $user_id) {
+			$token = wp_generate_password(64, false);
+			$sim_users = get_option('dbgtbl_sim_users', array());
+			$sim_users[$token] = $user_id;
+			update_option('dbgtbl_sim_users', $sim_users);
+
 			// Set cookie
-			setcookie(self::SIMULATE_USER_COOKIE, $user_id, array(
+			setcookie(self::SIMULATE_USER_COOKIE, $token, array(
 				'expires' => time() + DAY_IN_SECONDS,
 				'path' => COOKIEPATH,
 				'domain' => COOKIE_DOMAIN,
@@ -945,8 +969,18 @@ class Debug_Troubleshooter
 				'httponly' => true,
 				'secure' => is_ssl(),
 			));
-			wp_send_json_success(array('message' => __('User simulation activated. Reloading...', 'debugger-troubleshooter')));
+			wp_send_json_success(array(
+				'message'  => __('User simulation activated. Redirecting...', 'debugger-troubleshooter'),
+				'redirect' => admin_url()
+			));
 		} else {
+			$token = isset($_COOKIE[self::SIMULATE_USER_COOKIE]) ? sanitize_text_field(wp_unslash($_COOKIE[self::SIMULATE_USER_COOKIE])) : false;
+			if ($token) {
+				$sim_users = get_option('dbgtbl_sim_users', array());
+				unset($sim_users[$token]);
+				update_option('dbgtbl_sim_users', $sim_users);
+			}
+
 			// Clear cookie
 			setcookie(self::SIMULATE_USER_COOKIE, '', array(
 				'expires' => time() - 3600,
@@ -964,6 +998,73 @@ class Debug_Troubleshooter
 			}
 
 			wp_send_json_success(array('message' => __('User simulation deactivated.', 'debugger-troubleshooter')));
+		}
+	}
+
+	/**
+	 * Installs the MU plugin used to intercept active plugins before standard plugins are loaded.
+	 */
+	private function install_mu_plugin()
+	{
+		$mu_dir = WPMU_PLUGIN_DIR;
+		if (!is_dir($mu_dir)) {
+			@mkdir($mu_dir, 0755, true);
+		}
+
+		$mu_file = $mu_dir . '/debugger-troubleshooter-mu.php';
+
+		$mu_content = "<?php
+/**
+ * Plugin Name: Debugger & Troubleshooter (MU Plugin)
+ * Description: Intercepts active plugins to apply troubleshooting mode correctly.
+ * Version: 1.0
+ * Author: Jhimross
+ */
+
+if (!defined('ABSPATH')) {
+	exit;
+}
+
+// Ensure the token from cookie exists and maps to an active session.
+if (isset(\$_COOKIE['wp_debug_troubleshoot_mode'])) {
+	\$token = sanitize_text_field(wp_unslash(\$_COOKIE['wp_debug_troubleshoot_mode']));
+	\$sessions = get_option('dbgtbl_sessions', array());
+
+	if (isset(\$sessions[\$token]) && is_array(\$sessions[\$token])) {
+		// Replace active plugins for this request
+		add_filter('option_active_plugins', function (\$plugins) use (\$sessions, \$token) {
+			if (isset(\$sessions[\$token]['plugins'])) {
+				return \$sessions[\$token]['plugins'];
+			}
+			return \$plugins;
+		}, 0);
+
+		if (is_multisite()) {
+			add_filter('site_option_active_sitewide_plugins', function (\$plugins) use (\$sessions, \$token) {
+				if (isset(\$sessions[\$token]['sitewide_plugins'])) {
+					\$new_plugins = array();
+					foreach (\$sessions[\$token]['sitewide_plugins'] as \$plugin_file) {
+						\$new_plugins[\$plugin_file] = time();
+					}
+					return \$new_plugins;
+				}
+				return \$plugins;
+			}, 0);
+		}
+	}
+}
+";
+		@file_put_contents($mu_file, $mu_content);
+	}
+
+	/**
+	 * Removes the MU plugin when no longer needed.
+	 */
+	private function remove_mu_plugin()
+	{
+		$mu_file = WPMU_PLUGIN_DIR . '/debugger-troubleshooter-mu.php';
+		if (file_exists($mu_file)) {
+			@unlink($mu_file);
 		}
 	}
 }
